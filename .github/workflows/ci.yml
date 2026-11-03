@@ -1,9 +1,10 @@
 name: ci
 
-# Runs the regression suites for both tools.
+# Runs the regression suites for both tools, plus two structural guards that the
+# unit tests cannot express.
 #
-# Deliberately contains no internal hostnames or addresses: the tests stub all
-# HTTP, so this needs no service, no secrets and no network access beyond pip.
+# Deliberately contains no internal hostnames or addresses, no secrets, and needs
+# no network beyond pip: every HTTP call in the suites is stubbed.
 on:
   push:
     branches: [main]
@@ -27,65 +28,58 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        # The tools' only runtime dependencies. Ranges, not pins: the tests mock
-        # every HTTP call, so they should hold across the supported range rather
-        # than only against one frozen pair.
+        # Ranges, not pins: every HTTP call is mocked, so the suites should hold
+        # across the supported range rather than against one frozen pair.
         run: |
           python -m pip install --upgrade pip
-          pip install "requests>=2.31,<3" "pydantic>=2,<3"
+          pip install -r requirements.txt
 
       - name: Compile check
-        # Catches a syntax error on every supported Python version without
-        # needing the tools to be importable.
         run: python -m py_compile *.py
 
       - name: Tests
-        # `python -m unittest`, not a bare runner: the -m form is what puts the
-        # repository root on sys.path, and the tests load each tool by path
-        # relative to their own file, so the tree must stay flat.
+        # `python -m unittest`, not a bare runner: the -m form puts the
+        # repository root on sys.path, and each suite resolves its tool by path
+        # relative to its own file, so the tree must stay flat.
         run: python -m unittest test_rag_tool test_research_rag_key test_research_tool -v
 
-      - name: Assert tools and their tests are siblings
-        # Every test_*.py resolves its tool with `Path(__file__).with_name(...)`.
-        # Moving a tool into a subdirectory silently breaks its suite, so assert
-        # the layout rather than rely on the convention being remembered.
-        run: |
-          for pair in "rag-openwebui-tool.py:test_rag_tool.py" \
-                      "research-openwebui-tool.py:test_research_rag_key.py" \
-                      "research-openwebui-tool.py:test_research_tool.py"; do
-            tool="${pair%%:*}"; test="${pair##*:}"
-            if [ ! -f "$tool" ] || [ ! -f "$test" ]; then
-              echo "::error::missing $tool or $test"
-              exit 1
-            fi
-            if ! grep -q "with_name(\"$tool\")" "$test"; then
-              echo "::error::$test does not load $tool from the same directory"
-              exit 1
-            fi
-          done
-          echo "layout ok: every tool is beside its test"
-
-      - name: Assert no valve default carries a credential or a private address
-        # A public repo must not ship a default host or key that only works on a
-        # private network. The tests cannot catch this, so check it directly.
+      - name: Assert each suite's tool is beside it
+        # Every test_*.py resolves its tool with Path(__file__).with_name(...) or
+        # with os.path.join(os.path.dirname(__file__), ...). Moving a tool into a
+        # subdirectory silently breaks its suite, so assert the layout.
+        #
+        # Checks the FILENAMES each suite references rather than the import style:
+        # the two tools use different idioms, and an earlier version of this guard
+        # matched only one of them and failed on a healthy tree.
         run: |
           set -eu
           fail=0
-          if grep -nE 'default="[^"]*(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' *.py; then
-            echo "::error::a valve default contains a private IP address"; fail=1
-          fi
-          if grep -nE 'default="[^"]*\.(nuc|local|lan|internal)\b' *.py; then
-            echo "::error::a valve default contains an internal hostname"; fail=1
-          fi
-          # Valve key defaults must be empty: an actual value here would be a
-          # committed credential.
-          if grep -nE '(api_key|token|secret):\s*str\s*=\s*Field\(\s*default="[^"]+"' *.py; then
-            echo "::error::a credential valve has a non-empty default"; fail=1
-          fi
+          for test_file in test_*.py; do
+            refs=$(grep -oE '"[A-Za-z0-9_.-]+\.py"' "$test_file" | tr -d '"' | sort -u)
+            if [ -z "$refs" ]; then
+              echo "::error::$test_file references no tool file"
+              fail=1
+              continue
+            fi
+            for ref in $refs; do
+              if [ ! -f "$ref" ]; then
+                echo "::error::$test_file references $ref, which is not beside it"
+                fail=1
+              else
+                echo "ok: $test_file -> $ref"
+              fi
+            done
+          done
           exit $fail
 
-      - name: Assert plan/internal documents are absent
-        # Guards against publishing development notes into this repository.
+      - name: Assert valve defaults are public-safe
+        # A valve default ships to strangers: it must carry no credential, no
+        # private address and no internal hostname. Parsed with ast because both
+        # tools declare credentials as a multi-line Field( -- a line-oriented
+        # grep reports "clean" while a live key sits in the default.
+        run: python scripts/check_valve_defaults.py *.py
+
+      - name: Assert internal documents are absent
         run: |
           set -eu
           for f in plan.md NOTES.md HANDOFF.md internal.md; do
