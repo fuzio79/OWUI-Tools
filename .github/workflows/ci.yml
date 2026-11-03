@@ -1,0 +1,97 @@
+name: ci
+
+# Runs the regression suites for both tools.
+#
+# Deliberately contains no internal hostnames or addresses: the tests stub all
+# HTTP, so this needs no service, no secrets and no network access beyond pip.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        # The tools' only runtime dependencies. Ranges, not pins: the tests mock
+        # every HTTP call, so they should hold across the supported range rather
+        # than only against one frozen pair.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "requests>=2.31,<3" "pydantic>=2,<3"
+
+      - name: Compile check
+        # Catches a syntax error on every supported Python version without
+        # needing the tools to be importable.
+        run: python -m py_compile *.py
+
+      - name: Tests
+        # `python -m unittest`, not a bare runner: the -m form is what puts the
+        # repository root on sys.path, and the tests load each tool by path
+        # relative to their own file, so the tree must stay flat.
+        run: python -m unittest test_rag_tool test_research_rag_key test_research_tool -v
+
+      - name: Assert tools and their tests are siblings
+        # Every test_*.py resolves its tool with `Path(__file__).with_name(...)`.
+        # Moving a tool into a subdirectory silently breaks its suite, so assert
+        # the layout rather than rely on the convention being remembered.
+        run: |
+          for pair in "rag-openwebui-tool.py:test_rag_tool.py" \
+                      "research-openwebui-tool.py:test_research_rag_key.py" \
+                      "research-openwebui-tool.py:test_research_tool.py"; do
+            tool="${pair%%:*}"; test="${pair##*:}"
+            if [ ! -f "$tool" ] || [ ! -f "$test" ]; then
+              echo "::error::missing $tool or $test"
+              exit 1
+            fi
+            if ! grep -q "with_name(\"$tool\")" "$test"; then
+              echo "::error::$test does not load $tool from the same directory"
+              exit 1
+            fi
+          done
+          echo "layout ok: every tool is beside its test"
+
+      - name: Assert no valve default carries a credential or a private address
+        # A public repo must not ship a default host or key that only works on a
+        # private network. The tests cannot catch this, so check it directly.
+        run: |
+          set -eu
+          fail=0
+          if grep -nE 'default="[^"]*(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' *.py; then
+            echo "::error::a valve default contains a private IP address"; fail=1
+          fi
+          if grep -nE 'default="[^"]*\.(nuc|local|lan|internal)\b' *.py; then
+            echo "::error::a valve default contains an internal hostname"; fail=1
+          fi
+          # Valve key defaults must be empty: an actual value here would be a
+          # committed credential.
+          if grep -nE '(api_key|token|secret):\s*str\s*=\s*Field\(\s*default="[^"]+"' *.py; then
+            echo "::error::a credential valve has a non-empty default"; fail=1
+          fi
+          exit $fail
+
+      - name: Assert plan/internal documents are absent
+        # Guards against publishing development notes into this repository.
+        run: |
+          set -eu
+          for f in plan.md NOTES.md HANDOFF.md internal.md; do
+            if [ -e "$f" ]; then
+              echo "::error::$f is an internal document and must not be published"
+              exit 1
+            fi
+          done
+          echo "no internal working documents present"
