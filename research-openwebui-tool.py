@@ -101,6 +101,44 @@ _NO_RESULTS_SENTINEL = "No relevant documents found in the knowledge base."
 # NEW: rag-middleware caps query at 4000 chars; match it here.
 _MAX_QUERY_CHARS = 4000
 
+# NEW: rag-middleware namespaces stored `source` keys (PR #19):
+#   url:<url>   upload:<filename>
+# The prefix is not a scheme, so _clean_url rejects it, and silently falling
+# back to the caller's URL loses the fact that the crawler landed elsewhere
+# after a redirect.
+_SOURCE_PREFIXES = ("url:", "upload:")
+_MAX_REASONS = 5
+
+
+def _bare_source(value: Any, fallback: str) -> str:
+    """Strip a storage-namespace prefix from a `source` value."""
+    text = str(value or "").strip()
+    for prefix in _SOURCE_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return text or fallback
+
+
+def _reason_summary(entries: Any, why_key: str) -> Dict[str, int]:
+    """Count skip/fail reasons, deduplicated and bounded.
+
+    The server reports why each link was skipped or failed. Counting them is
+    what makes the outcome actionable: `skipped_count: 12` alone cannot tell a
+    caller whether to raise the chunk budget or the deadline.
+    """
+    if not isinstance(entries, list):
+        return {}
+    counts: Dict[str, int] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        reason = _clean_inline(entry.get(why_key) or "unknown", limit=120)
+        if reason:
+            counts[reason] = counts.get(reason, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return dict(ranked[:_MAX_REASONS])
+
 
 def _wrap_untrusted(text: str) -> str:
     """Wrap retrieved text in clear delimiters (prompt-injection hygiene)."""
@@ -705,9 +743,13 @@ class _Pipeline:
         if not isinstance(data, dict):
             return {"status": "ok", "source": url,
                     "note": "Ingest response omitted (unexpected shape)."}
+        # CHANGED: strip the `url:`/`upload:` namespace before _clean_url sees
+        # it. `url:` is not an allowed scheme, so the prefix would make
+        # _clean_url return "" and hide a redirect behind the caller's URL.
+        source = _clean_url(_bare_source(data.get("source"), "")) or url
         out: Dict[str, Any] = {
             "status": data.get("status", "success"),
-            "source": _clean_url(data.get("source")) or url,
+            "source": source,
             "outcome": data.get("outcome"),
             "chunks_processed": data.get("chunks_processed", 0),
             "links_found": data.get("links_count", 0),
@@ -717,6 +759,14 @@ class _Pipeline:
                            ("failed_count", "failed")):
             v = data.get(field)
             out[key] = len(v) if isinstance(v, list) else 0
+        # CHANGED: only present when non-empty. An empty dict on every clean
+        # ingest is noise, and the model reads it as "something went wrong".
+        skipped_reasons = _reason_summary(data.get("skipped"), "reason")
+        if skipped_reasons:
+            out["skipped_reasons"] = skipped_reasons
+        failed_reasons = _reason_summary(data.get("failed"), "error")
+        if failed_reasons:
+            out["failed_reasons"] = failed_reasons
         if data.get("outcome") == "unchanged":
             out["note"] = "Page already indexed with identical content."
         elif data.get("outcome") == "empty":
