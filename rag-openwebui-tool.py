@@ -10,6 +10,38 @@ logger = logging.getLogger("tools_plugin")
 VALID_ENGINES = {"auto", "crawl4ai", "firecrawl"}
 MAX_QUERY_LENGTH = 4000  # must match the server's RAGQuery limit
 
+# rag-middleware namespaces stored `source` keys (PR #19):
+#   url:<url>   upload:<filename>
+# The prefix is an internal identity, not something to show a model as if it
+# were part of the address.
+_SOURCE_PREFIXES = ("url:", "upload:")
+_MAX_REASONS = 5
+
+
+def _bare_source(value: Any, fallback: str) -> str:
+    """Strip a storage-namespace prefix from a `source` value."""
+    text = str(value or "").strip()
+    for prefix in _SOURCE_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    return text or fallback
+
+
+def _reason_summary(entries: Any, why_key: str) -> Dict[str, int]:
+    """Count skip/fail reasons, deduplicated and bounded (max 5)."""
+    if not isinstance(entries, list):
+        return {}
+    counts: Dict[str, int] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        reason = str(entry.get(why_key) or "unknown").strip()[:120]
+        if reason:
+            counts[reason] = counts.get(reason, 0) + 1
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return dict(ranked[:_MAX_REASONS])
+
 
 def _safe_url(url: str) -> str:
     """URL without query string / userinfo, for logs."""
@@ -119,10 +151,32 @@ class Tools:
             )
         if response.status_code >= 500:
             return f"The RAG service failed (HTTP {response.status_code})."
+
+        if response.status_code == 404:
+            # Usually a base-URL mistake rather than a deleted endpoint.
+            return (
+                "The RAG service has no such endpoint (HTTP 404). Check the "
+                "`rag_server_host` valve, including the /api/v1 prefix."
+            )
+
         try:
             detail = response.json().get("detail")
         except ValueError:
             detail = None
+
+        # FastAPI answers 422 with a LIST of validation objects. Stringifying
+        # that gives the model a Python repr with single quotes -- neither
+        # prose nor JSON, and it never says which field was rejected.
+        if response.status_code == 422 and isinstance(detail, list):
+            parts = []
+            for item in detail[:3]:
+                if not isinstance(item, dict):
+                    continue
+                loc = ".".join(str(x) for x in (item.get("loc") or [])[1:]) or "body"
+                parts.append(f"{loc}: {item.get('msg', 'invalid value')}")
+            if parts:
+                return "The RAG service rejected the request: " + "; ".join(parts)
+
         if isinstance(detail, str) and detail:
             return detail[:300]
         if detail:
@@ -262,7 +316,7 @@ class Tools:
 
         summary: Dict[str, Any] = {
             "status": result.get("status", "success"),
-            "source": result.get("source", url),
+            "source": _bare_source(result.get("source"), url),
             "engine": result.get("engine"),
             "outcome": result.get("outcome"),
             "chunks_processed": result.get("chunks_processed", 0),
@@ -272,6 +326,14 @@ class Tools:
             "skipped_count": len(skipped),
             "failed_count": len(failed),
         }
+        # Additive, and only when non-empty: an empty dict on every clean
+        # ingest reads as a problem and costs context for nothing.
+        skipped_reasons = _reason_summary(skipped, "reason")
+        if skipped_reasons:
+            summary["skipped_reasons"] = skipped_reasons
+        failed_reasons = _reason_summary(failed, "error")
+        if failed_reasons:
+            summary["failed_reasons"] = failed_reasons
         if result.get("outcome") == "unchanged":
             summary["note"] = (
                 "This page was already in the knowledge base with identical "
