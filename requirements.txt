@@ -1,0 +1,12 @@
+# requests/pydantic are the only libraries the pure-HTTP tools need.
+#
+# The Nextcloud calendar tool additionally imports `caldav` and `icalendar`;
+# it is the only tool that does, so they are optional and left out of the
+# default install. Pull them in only if you use that tool:
+#
+#     pip install caldav icalendar
+#
+# Ranges, not pins: every HTTP call in the suites is stubbed, so the tests
+# should hold across the supported range rather than against one frozen pair.
+requests>=2.31,<3
+pydantic>=2,<3

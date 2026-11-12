@@ -1,0 +1,170 @@
+name: ci
+
+# Runs every regression suite, plus three structural guards that the unit tests
+# cannot express.
+#
+# Deliberately contains no internal hostnames or addresses, no secrets, and needs
+# no network beyond pip: every HTTP call in the suites is stubbed.
+#
+# This file lives in .github/ because it is meant to run on GitHub, and the
+# public snapshot publishes it. Gitea keeps the canonical copy so the sync has
+# something to publish - without it, a force-push would delete the file from the
+# public repo.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        # Ranges, not pins: every HTTP call is mocked, so the suites should hold
+        # across the supported range rather than against one frozen pair.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile check
+        # These files are pasted into Open WebUI by hand, so a syntax error here
+        # would reach every user rather than being caught at import time.
+        run: python -m py_compile *.py scripts/*.py
+
+      - name: Install test runner
+        # Seven suites are pytest-style: their tests are module-level
+        # `def test_*` functions, which unittest ignores because it only
+        # collects TestCase subclasses. Without this the runner is absent and
+        # those suites contribute nothing while the job still reports green.
+        run: pip install pytest
+
+      - name: Tests
+        # `python -m unittest`, not a bare runner: the -m form puts the
+        # repository root on sys.path, and each suite resolves its tool by path
+        # relative to its own file, so the tree must stay flat.
+        #
+        # Every suite is listed explicitly rather than discovered, so a suite
+        # that stops being run is a visible diff rather than a silent drop.
+        run: |
+          python -m unittest \
+            test_docker_exec_tool \
+            test_dockhand_tool \
+            test_pi_agent_tool \
+            test_rag_tool \
+            test_research_rag_key \
+            test_research_ingest_v2 \
+            test_research_tool \
+            -v
+
+      - name: Tests (pytest suites)
+        # Listed explicitly, for the same reason as the step above: a suite that
+        # stops being run should be a visible diff rather than a silent drop.
+        #
+        # NOT `pytest -q` with no arguments: discovery would also pick up the
+        # unittest suites, double-running them, and would make these seven
+        # disappear from this file where no one would notice.
+        run: |
+          python -m pytest \
+            test_rag_tool_direct.py \
+            test_rag_tool_fetch_delete.py \
+            test_research_direct_fetch.py \
+            test_research_fetch_engine_leak.py \
+            test_research_fetch_engine_param.py \
+            test_research_ingest_errors.py \
+            test_research_soft_deadline.py \
+            test_tools_async_guard.py \
+            -q
+
+      - name: Assert every suite on disk is run by this workflow
+        # THE DEFECT THIS GUARDS. Seven suites existed in the repository and were
+        # named nowhere in this workflow, so every push reported green while a
+        # third of the tree never ran. Naming suites explicitly (as both steps
+        # above do) prevents a SILENT DROP; it creates the opposite risk, a new
+        # suite nobody remembers to add here. This closes that.
+        #
+        # MATCHES ON THE STEM, NOT THE FILENAME. The unittest step names modules
+        # (`test_rag_tool`) because `python -m unittest` takes module names,
+        # while the pytest step needs paths (`test_rag_tool.py`). A guard looking
+        # for the filename therefore fails on every unittest suite -- which it
+        # did, on this workflow, on the first run.
+        #
+        # The boundary group is load-bearing: a plain substring match lets
+        # `test_rag_tool` be satisfied by `test_rag_tool_direct`, a different
+        # suite. Verified both ways before committing.
+        run: |
+          set -eu
+          fail=0
+          for f in test_*.py; do
+            stem="${f%.py}"
+            if grep -qE "(^|[^A-Za-z0-9_])${stem}($|[^A-Za-z0-9_])" .github/workflows/ci.yml; then
+              echo "ok: $f"
+            else
+              echo "::error::$f exists but is named nowhere in this workflow, so it never runs"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::add the suite to the appropriate Tests step above"
+            exit 1
+          fi
+          echo "every suite on disk is run by this workflow"
+
+      - name: Assert each suite's tool is beside it
+        # Every test_*.py resolves its tool with Path(__file__).with_name(...) or
+        # os.path.join(os.path.dirname(__file__), ...). Moving a tool into a
+        # subdirectory silently breaks its suite, so assert the layout.
+        #
+        # Checks the FILENAMES each suite references rather than the import style:
+        # the tools use different idioms, and an earlier version of this guard
+        # matched only one of them and failed on a healthy tree.
+        run: |
+          set -eu
+          fail=0
+          for test_file in test_*.py; do
+            refs=$(grep -oE '"[A-Za-z0-9_.-]+\.py"' "$test_file" | tr -d '"' | sort -u)
+            if [ -z "$refs" ]; then
+              echo "::error::$test_file references no tool file"
+              fail=1
+              continue
+            fi
+            for ref in $refs; do
+              if [ ! -f "$ref" ]; then
+                echo "::error::$test_file references $ref, which is not beside it"
+                fail=1
+              else
+                echo "ok: $test_file -> $ref"
+              fi
+            done
+          done
+          exit $fail
+
+      - name: Assert valve defaults are public-safe
+        # A valve default ships to strangers: it must carry no credential, no
+        # private address and no internal hostname. Parsed with ast because the
+        # tools declare credentials as a multi-line Field( -- a line-oriented
+        # grep reports "clean" while a live key sits in the default.
+        run: python scripts/check_valve_defaults.py *.py
+
+      - name: Assert internal documents are absent
+        run: |
+          set -eu
+          for f in plan.md NOTES.md HANDOFF.md internal.md; do
+            if [ -e "$f" ]; then
+              echo "::error::$f is an internal document and must not be published"
+              exit 1
+            fi
+          done
+          echo "no internal working documents present"
